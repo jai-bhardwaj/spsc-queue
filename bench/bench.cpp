@@ -37,20 +37,25 @@ namespace {
 using Clock = std::chrono::steady_clock;
 using ns = std::chrono::nanoseconds;
 
-constexpr int kReps = 5;
+// 9 reps, and the first is discarded as a warm-up. This is not pedantry: an
+// earlier version used 5 reps with no warm-up and reported the mutex baseline
+// at 89 ns/item, making the lock-free queue look 4.3x faster. The real figure
+// is ~2.5x. The cold run — cold caches, cold branch predictors, the OS not yet
+// settled on a core — was dragging the median. See README, "What the first
+// benchmark got wrong".
+constexpr int kReps = 9;
 constexpr int kThroughputItems = 2'000'000;
 constexpr int kRoundTrips = 200'000;
 constexpr std::size_t kCapacity = 1024;
 
-double median(std::vector<double> v) {
-    std::sort(v.begin(), v.end());
-    return v[v.size() / 2];
-}
-
 // ---- lock-free throughput --------------------------------------------------
 
-double throughput_spsc_ns_per_item() {
-    spsc::Queue<int> q(kCapacity);
+// Templated on the index-caching flag so the same code path measures both
+// variants. The README claims the caching is worth something; this is what
+// makes that claim checkable instead of asserted.
+template <bool CacheIndices>
+double throughput_ns_per_item() {
+    spsc::Queue<int, CacheIndices> q(kCapacity);
     const auto t0 = Clock::now();
 
     std::thread producer([&] {
@@ -71,6 +76,9 @@ double throughput_spsc_ns_per_item() {
     if (sink == -1) std::printf("unreachable\n");
     return static_cast<double>(elapsed) / kThroughputItems;
 }
+
+double throughput_spsc_ns_per_item() { return throughput_ns_per_item<true>(); }
+double throughput_uncached_ns_per_item() { return throughput_ns_per_item<false>(); }
 
 // ---- mutex baseline --------------------------------------------------------
 
@@ -156,12 +164,17 @@ double uncontended_push_pop_ns() {
     return static_cast<double>(elapsed) / kOps;
 }
 
+// Reports the spread alongside the median, so a reader can see for themselves
+// how noisy the machine was rather than trusting a single number.
 template <typename F>
-double best_of(F f) {
+void measure(const char* label, F f, double& out_median) {
+    f();  // warm-up
     std::vector<double> runs;
     runs.reserve(kReps);
     for (int i = 0; i < kReps; ++i) runs.push_back(f());
-    return median(runs);
+    std::sort(runs.begin(), runs.end());
+    out_median = runs[runs.size() / 2];
+    std::printf("| %-40s | %6.1f | %5.1f | %5.1f |\n", label, out_median, runs.front(), runs.back());
 }
 
 }  // namespace
@@ -171,17 +184,19 @@ int main() {
     std::printf("capacity %zu slots, median of %d runs, %d hardware threads\n\n",
                 kCapacity, kReps, static_cast<int>(std::thread::hardware_concurrency()));
 
-    const double st = best_of(uncontended_push_pop_ns);
-    const double tp = best_of(throughput_spsc_ns_per_item);
-    const double mx = best_of(throughput_mutex_ns_per_item);
-    const double rt = best_of(roundtrip_spsc_ns);
+    double st = 0, tp = 0, uc = 0, mx = 0, rt = 0;
 
-    std::printf("| Benchmark                                  | ns/op  | items/sec   |\n");
-    std::printf("| ------------------------------------------ | ------ | ----------- |\n");
-    std::printf("| push+pop, single thread, uncontended       | %6.1f | %11.0f |\n", st, 1e9 / st);
-    std::printf("| throughput, 1 producer + 1 consumer        | %6.1f | %11.0f |\n", tp, 1e9 / tp);
-    std::printf("| throughput, std::mutex + std::deque        | %6.1f | %11.0f |\n", mx, 1e9 / mx);
-    std::printf("| round-trip latency (ping-pong, 2 queues)   | %6.1f | %11s |\n", rt, "-");
-    std::printf("\nlock-free is %.1fx the mutex baseline on throughput\n", mx / tp);
+    std::printf("| %-40s | %6s | %5s | %5s |\n", "Benchmark (ns/op)", "median", "min", "max");
+    std::printf("| %-40s | %6s | %5s | %5s |\n", "----------------------------------------",
+                "------", "-----", "-----");
+    measure("push+pop, single thread, uncontended", uncontended_push_pop_ns, st);
+    measure("throughput, 1 producer + 1 consumer", throughput_spsc_ns_per_item, tp);
+    measure("throughput, index caching DISABLED", throughput_uncached_ns_per_item, uc);
+    measure("throughput, std::mutex + std::deque", throughput_mutex_ns_per_item, mx);
+    measure("round-trip latency (ping-pong, 2 queues)", roundtrip_spsc_ns, rt);
+
+    std::printf("\nthroughput: %.0f M items/sec\n", 1e3 / tp);
+    std::printf("lock-free is %.2fx the mutex baseline\n", mx / tp);
+    std::printf("index caching is worth %.2fx (%.1f ns -> %.1f ns per item)\n", uc / tp, uc, tp);
     return 0;
 }

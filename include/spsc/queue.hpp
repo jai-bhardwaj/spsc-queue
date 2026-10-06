@@ -49,7 +49,10 @@ namespace spsc {
 // pairs it is merely conservative, which is the safe direction to be wrong in.
 inline constexpr std::size_t kCacheLine = 64;
 
-template <typename T>
+// CacheIndices exists so the third optimisation above can be switched off and
+// measured rather than asserted. Leave it true in real use; the benchmark
+// instantiates a false version to report what the caching is actually worth.
+template <typename T, bool CacheIndices = true>
 class Queue {
     static_assert(std::is_nothrow_destructible_v<T>,
                   "T must be nothrow-destructible: the ring destroys elements during unwind");
@@ -83,11 +86,16 @@ public:
         const std::size_t tail = tail_.load(std::memory_order_relaxed);
         const std::size_t next = (tail + 1) & mask_;
 
-        // Fast path: trust the cached head. Only if it says we are full do we
-        // pay for a load of the consumer's real head_.
-        if (next == cached_head_) {
-            cached_head_ = head_.load(std::memory_order_acquire);
-            if (next == cached_head_) return false;  // genuinely full
+        if constexpr (CacheIndices) {
+            // Fast path: trust the cached head. Only if it says we are full do
+            // we pay for a load of the consumer's real head_.
+            if (next == cached_head_) {
+                cached_head_ = head_.load(std::memory_order_acquire);
+                if (next == cached_head_) return false;  // genuinely full
+            }
+        } else {
+            // Uncached: load the consumer's line on every single push.
+            if (next == head_.load(std::memory_order_acquire)) return false;
         }
 
         ::new (buffer_ + tail) T(std::forward<Args>(args)...);
@@ -105,9 +113,13 @@ public:
     // Pointer to the oldest element, or nullptr when empty. Valid until pop().
     T* front() noexcept {
         const std::size_t head = head_.load(std::memory_order_relaxed);
-        if (head == cached_tail_) {
-            cached_tail_ = tail_.load(std::memory_order_acquire);
-            if (head == cached_tail_) return nullptr;  // genuinely empty
+        if constexpr (CacheIndices) {
+            if (head == cached_tail_) {
+                cached_tail_ = tail_.load(std::memory_order_acquire);
+                if (head == cached_tail_) return nullptr;  // genuinely empty
+            }
+        } else {
+            if (head == tail_.load(std::memory_order_acquire)) return nullptr;
         }
         return buffer_ + head;
     }
@@ -115,7 +127,13 @@ public:
     // Destroys the front element. Undefined if the queue is empty.
     void pop() noexcept {
         const std::size_t head = head_.load(std::memory_order_relaxed);
-        assert(head != cached_tail_ && "pop() on an empty queue");
+        // cached_tail_ is only meaningful when the caching is enabled; with it
+        // off the authoritative tail_ is the only thing to check against.
+        if constexpr (CacheIndices) {
+            assert(head != cached_tail_ && "pop() on an empty queue");
+        } else {
+            assert(head != tail_.load(std::memory_order_acquire) && "pop() on an empty queue");
+        }
         buffer_[head].~T();
         pop_slot();
     }
