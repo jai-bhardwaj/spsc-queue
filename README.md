@@ -49,14 +49,26 @@ discarded warm-up; min and max given so you can see the noise rather than take t
 
 About **46 M items/sec** on the threaded throughput benchmark.
 
-**On the mutex comparison, the honest answer is a range, not a number.** Across repeated runs the
-lock-free queue came out between **2.4× and 3.3×** the mutex baseline. The lock-free figure is
-fairly stable (~22 ns); the mutex baseline is not, swinging between 55 and 93 ns depending on how
-the scheduler feels. Quoting a single multiplier here would be false precision, so: it is a few
-times faster, and the gap widens as the machine gets busier.
+**On the mutex comparison, there is no number I am willing to publish.** The earlier version of
+this section quoted **2.4× to 3.3×**, which was already a retreat from a wrong 4.3×. Re-measured
+across thirteen runs on the same laptop, the mutex baseline alone ranged from **51 ns to 125 ns**
+— a 2.4× swing in the denominator — and the resulting multiplier ranged from 1.8× to 5.2×. So the
+stated range was not just too narrow, it did not contain most of what the machine actually does.
 
-**Index caching is worth about 1.13×** (24.7 → 21.8 ns), consistently measured between 1.10× and
-1.18×. That is a real but modest win — see below for why I originally thought it was much bigger.
+The lock-free side is the stable one: 19–24 ns per item across the same runs. The mutex side is
+not stable, and any multiplier is therefore a property of the scheduler rather than of either
+queue. The defensible statement is the two distributions, which is what the table above gives.
+
+**Index caching is worth about 1.13×** (24.7 → 21.8 ns). Settled runs put it between 1.10× and
+1.28×. Under load it has measured as low as **0.61×**, i.e. the optimisation appearing actively
+harmful — which it is not, and which is a property of the measurement, not the code. That one
+reading is why `bench` now refuses to print any ratio when the load average exceeds 35% of core
+count, or when the relative spread of any benchmark exceeds 50%. The medians still print so you
+can see the state of the machine; the multipliers are withheld and the binary exits non-zero.
+
+That guard matters more than the numbers it withholds. Everything wrong with the first version of
+this benchmark was a confident figure sitting on an unexamined baseline, and the harness had no
+way to say so.
 
 Reproduce:
 
@@ -66,7 +78,8 @@ cmake -B build -DCMAKE_BUILD_TYPE=Release && cmake --build build && ./build/spsc
 
 Threads are not pinned to cores. On a machine with performance and efficiency clusters that adds
 real variance, which is why the spread is published alongside the median. Numbers are comparable
-within a run, not across machines.
+within a run, not across machines — **and not on a busy one.** Run it on an idle machine or the
+ratios will be withheld, by design.
 
 ## What the first benchmark got wrong
 
@@ -77,8 +90,10 @@ is the direction to be suspicious of.
 Three mistakes, all in the harness rather than the queue:
 
 1. **No warm-up.** The first timed run paid for cold caches, cold branch predictors and a scheduler
-   that had not yet settled the threads onto cores. It reported the mutex baseline at 89 ns/item
-   against a later steady-state 55–72 ns.
+   that had not yet settled the threads onto cores. It reported the mutex baseline at 89 ns/item,
+   and I treated a later 55–72 ns reading as the steady state. Thirteen further runs show there is
+   no steady state to find: that baseline spans 51–125 ns. The warm-up was a real bug, but it was
+   not the reason the number moved.
 2. **Too few repetitions.** Five runs with one bad outlier moves the median. Nine runs plus a
    discarded warm-up does not.
 3. **An unmeasured claim stated as fact.** "Roughly halves throughput" was my intuition about what
