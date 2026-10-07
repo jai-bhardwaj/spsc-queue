@@ -30,6 +30,7 @@
 #include <deque>
 #include <mutex>
 #include <thread>
+#include <cstdlib>
 #include <vector>
 
 namespace {
@@ -44,6 +45,8 @@ using ns = std::chrono::nanoseconds;
 // settled on a core — was dragging the median. See README, "What the first
 // benchmark got wrong".
 constexpr int kReps = 9;
+// Above this relative spread a median is noise, not a measurement.
+constexpr double kSpreadLimit = 0.50;
 constexpr int kThroughputItems = 2'000'000;
 constexpr int kRoundTrips = 200'000;
 constexpr std::size_t kCapacity = 1024;
@@ -167,36 +170,86 @@ double uncontended_push_pop_ns() {
 // Reports the spread alongside the median, so a reader can see for themselves
 // how noisy the machine was rather than trusting a single number.
 template <typename F>
-void measure(const char* label, F f, double& out_median) {
+void measure(const char* label, F f, double& out_median, double& worst_spread) {
     f();  // warm-up
     std::vector<double> runs;
     runs.reserve(kReps);
     for (int i = 0; i < kReps; ++i) runs.push_back(f());
     std::sort(runs.begin(), runs.end());
     out_median = runs[runs.size() / 2];
-    std::printf("| %-40s | %6.1f | %5.1f | %5.1f |\n", label, out_median, runs.front(), runs.back());
+
+    // Relative spread is the honest noise signal. A median is only worth
+    // quoting when the runs behind it agree; publishing one without this is
+    // how the first version of this benchmark reached a confident wrong answer.
+    const double spread = (runs.back() - runs.front()) / out_median;
+    if (spread > worst_spread) worst_spread = spread;
+
+    std::printf("| %-40s | %6.1f | %5.1f | %5.1f | %5.0f%% |%s\n", label, out_median,
+                runs.front(), runs.back(), spread * 100.0,
+                spread > kSpreadLimit ? "  <-- NOISY" : "");
 }
 
 }  // namespace
 
 int main() {
+    const int cores = static_cast<int>(std::thread::hardware_concurrency());
     std::printf("spsc::Queue benchmarks\n");
-    std::printf("capacity %zu slots, median of %d runs, %d hardware threads\n\n",
-                kCapacity, kReps, static_cast<int>(std::thread::hardware_concurrency()));
+    std::printf("capacity %zu slots, median of %d runs, %d hardware threads\n",
+                kCapacity, kReps, cores);
+
+    // A busy machine does not just add noise, it inverts conclusions: measured
+    // under load average 16 on an 8-core box, this benchmark reported index
+    // caching at 0.61x - the optimisation looking actively harmful. Refuse to
+    // publish derived ratios from a machine in that state.
+    double la[3] = {0, 0, 0};
+    const bool have_load = getloadavg(la, 3) == 3;
+    const double load_ratio = cores > 0 ? la[0] / cores : 0.0;
+    const bool machine_busy = have_load && load_ratio > 0.35;
+    if (have_load) {
+        std::printf("load average %.2f over %d cores (%.0f%% busy)%s\n", la[0], cores,
+                    load_ratio * 100.0,
+                    machine_busy ? "  <-- TOO BUSY TO TRUST" : "");
+    }
+    std::printf("\n");
 
     double st = 0, tp = 0, uc = 0, mx = 0, rt = 0;
+    double worst_spread = 0.0;
 
-    std::printf("| %-40s | %6s | %5s | %5s |\n", "Benchmark (ns/op)", "median", "min", "max");
-    std::printf("| %-40s | %6s | %5s | %5s |\n", "----------------------------------------",
-                "------", "-----", "-----");
-    measure("push+pop, single thread, uncontended", uncontended_push_pop_ns, st);
-    measure("throughput, 1 producer + 1 consumer", throughput_spsc_ns_per_item, tp);
-    measure("throughput, index caching DISABLED", throughput_uncached_ns_per_item, uc);
-    measure("throughput, std::mutex + std::deque", throughput_mutex_ns_per_item, mx);
-    measure("round-trip latency (ping-pong, 2 queues)", roundtrip_spsc_ns, rt);
+    std::printf("| %-40s | %6s | %5s | %5s | %5s |\n", "Benchmark (ns/op)", "median", "min",
+                "max", "sprd");
+    std::printf("| %-40s | %6s | %5s | %5s | %5s |\n", "----------------------------------------",
+                "------", "-----", "-----", "-----");
+    measure("push+pop, single thread, uncontended", uncontended_push_pop_ns, st, worst_spread);
+    measure("throughput, 1 producer + 1 consumer", throughput_spsc_ns_per_item, tp, worst_spread);
+    measure("throughput, index caching DISABLED", throughput_uncached_ns_per_item, uc, worst_spread);
+    measure("throughput, std::mutex + std::deque", throughput_mutex_ns_per_item, mx, worst_spread);
+    measure("round-trip latency (ping-pong, 2 queues)", roundtrip_spsc_ns, rt, worst_spread);
 
     std::printf("\nthroughput: %.0f M items/sec\n", 1e3 / tp);
-    std::printf("lock-free is %.2fx the mutex baseline\n", mx / tp);
-    std::printf("index caching is worth %.2fx (%.1f ns -> %.1f ns per item)\n", uc / tp, uc, tp);
+
+    // A ratio divides one noisy number by another, so it is the first thing to
+    // go wrong and the last thing a reader can check. Print it only when the
+    // runs behind it held still.
+    const bool trustworthy = !machine_busy && worst_spread <= kSpreadLimit;
+    if (trustworthy) {
+        std::printf("lock-free is %.2fx the mutex baseline\n", mx / tp);
+        std::printf("index caching is worth %.2fx (%.1f ns -> %.1f ns per item)\n", uc / tp, uc,
+                    tp);
+    } else {
+        std::printf("\nRATIOS WITHHELD. ");
+        if (machine_busy) {
+            std::printf("Load average %.2f on %d cores is too high. ", la[0], cores);
+        }
+        if (worst_spread > kSpreadLimit) {
+            std::printf("Worst relative spread was %.0f%%, over the %.0f%% limit. ", worst_spread * 100.0,
+                        kSpreadLimit * 100.0);
+        }
+        std::printf("\nThe per-benchmark medians above are still printed so you can see the\n"
+                    "state of the machine, but any multiplier derived from them would be a\n"
+                    "property of the scheduler rather than of the queue. Re-run on an idle\n"
+                    "machine. Measured under load, this benchmark has reported index caching\n"
+                    "at 0.61x, i.e. the optimisation looking harmful, which it is not.\n");
+        return 1;
+    }
     return 0;
 }
